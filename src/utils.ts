@@ -1,4 +1,104 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type {
+  AcceptanceResult,
+  DiffToken,
+  LayoutEvaluation,
+  LayoutScenarioKey,
+  LayoutStandard,
+  SignItem,
+  TermBinding,
+} from "./types";
+
+/**
+ * 按场景限定的版面标准：最低字号（像素）与最多行数。
+ * 场景名称命中关键词即适用对应标准。
+ */
+export const LAYOUT_STANDARDS: LayoutStandard[] = [
+  { key: "rail", label: "轨道交通", match: ["轨道交通", "地铁", "站台", "车站"], minFont: 40, maxLines: 4 },
+  { key: "mall", label: "商场疏散", match: ["商场", "疏散", "消防", "安全出口", "紧急出口"], minFont: 48, maxLines: 3 },
+  { key: "park", label: "公园服务", match: ["公园", "景区", "绿地", "服务亭"], minFont: 28, maxLines: 3 },
+  { key: "hospital", label: "医院入口", match: ["医院", "入口", "门诊", "急诊"], minFont: 32, maxLines: 2 },
+];
+
+export function standardForScenario(scenario: string): LayoutStandard | null {
+  const name = scenario ?? "";
+  return LAYOUT_STANDARDS.find((standard) => standard.match.some((keyword) => name.includes(keyword))) ?? null;
+}
+
+/** 验收依据指纹：译文、目标语言、场景、紧急修订任一变化都会使旧验收失效。 */
+export function acceptanceBasis(sign: SignItem): string {
+  return JSON.stringify({
+    targetText: sign.targetText,
+    targetLanguage: sign.targetLanguage,
+    scenario: sign.scenario,
+    emergencyRevision: sign.emergencyRevision,
+  });
+}
+
+export type AcceptanceState = "valid" | "stale" | "none";
+
+export function acceptanceState(sign: SignItem): AcceptanceState {
+  if (!sign.acceptance) return "none";
+  return sign.acceptance.basis === acceptanceBasis(sign) ? "valid" : "stale";
+}
+
+/** 对比失效验收的指纹，列出导致失效的变化项。 */
+export function acceptanceBasisChanges(sign: SignItem): string[] {
+  if (!sign.acceptance) return [];
+  let old: { targetText?: string; targetLanguage?: string; scenario?: string; emergencyRevision?: boolean };
+  try {
+    old = JSON.parse(sign.acceptance.basis);
+  } catch {
+    return ["验收依据已变化"];
+  }
+  const changes: string[] = [];
+  if (old.targetText !== sign.targetText) changes.push("译文已修改");
+  if (old.targetLanguage !== sign.targetLanguage) changes.push("目标语言已更换");
+  if (old.scenario !== sign.scenario) changes.push("适用场景已调整");
+  if (Boolean(old.emergencyRevision) !== sign.emergencyRevision) changes.push("紧急修订状态已切换");
+  return changes;
+}
+
+export function evaluateLayout(sign: SignItem, width?: number, fontSize?: number): LayoutEvaluation {
+  const standard = standardForScenario(sign.scenario);
+  const w = width ?? sign.previewWidth;
+  const font = fontSize ?? sign.previewFont;
+  const lineCount = estimatedLines(sign.targetText, w, font).length;
+  const failures: LayoutEvaluation["failures"] = [];
+  if (!standard) {
+    failures.push({ kind: "unknown", message: "场景未匹配轨道交通、商场疏散、公园服务、医院入口标准" });
+  } else {
+    if (font < standard.minFont) {
+      failures.push({
+        kind: "font",
+        message: `字号 ${font}px 低于「${standard.label}」最低 ${standard.minFont}px（缺 ${standard.minFont - font}px）`,
+      });
+    }
+    if (lineCount > standard.maxLines) {
+      failures.push({
+        kind: "lines",
+        message: `预计 ${lineCount} 行，超出「${standard.label}」最多 ${standard.maxLines} 行（超 ${lineCount - standard.maxLines} 行）`,
+      });
+    }
+  }
+  return { standard, width: w, fontSize: font, lineCount, pass: failures.length === 0, failures };
+}
+
+export function buildAcceptance(
+  sign: SignItem,
+  evaluation: LayoutEvaluation,
+  acceptedAt = new Date().toISOString(),
+): AcceptanceResult {
+  return {
+    passed: true,
+    width: evaluation.width,
+    fontSize: evaluation.fontSize,
+    lineCount: evaluation.lineCount,
+    standardKey: (evaluation.standard?.key ?? null) as LayoutScenarioKey | null,
+    standardLabel: evaluation.standard?.label ?? "未匹配场景标准",
+    basis: acceptanceBasis(sign),
+    acceptedAt,
+  };
+}
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];

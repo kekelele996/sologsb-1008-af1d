@@ -1,4 +1,5 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type { AcceptanceResult, ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import { acceptanceBasis } from "./utils";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -18,6 +19,22 @@ const term = (source: string, target: string, confirmed = false, required = true
   confirmed,
 });
 
+const layoutAcceptance = (
+  sign: SignItem,
+  standardLabel: string,
+  standardKey: AcceptanceResult["standardKey"],
+  acceptedAt: string,
+): AcceptanceResult => ({
+  passed: true,
+  width: sign.previewWidth,
+  fontSize: sign.previewFont,
+  lineCount: 3,
+  standardKey,
+  standardLabel,
+  basis: acceptanceBasis(sign),
+  acceptedAt,
+});
+
 export const createSeedProject = (): SignProject => {
   const signs: SignItem[] = [
     {
@@ -33,6 +50,9 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      previewWidth: 960,
+      previewFont: 48,
+      acceptance: null,
       updatedAt: "2026-09-21T09:20:00.000Z",
     },
     {
@@ -40,7 +60,7 @@ export const createSeedProject = (): SignProject => {
       code: "EM-02",
       sourceText: "紧急出口。发生紧急情况时，请按指示方向迅速撤离，不要乘坐电梯。",
       targetLanguage: "English",
-      targetText: "EMERGENCY EXIT\nIn an emergency, leave quickly in the direction shown. Do not use the elevator.",
+      targetText: "EMERGENCY EXIT\nIn an emergency, follow the exit signs. Do not use the elevator.",
       scenario: "商场疏散通道",
       regulation: "GB 13495.1-2015 消防安全标志",
       status: "confirmed",
@@ -48,6 +68,9 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      previewWidth: 960,
+      previewFont: 48,
+      acceptance: null,
       updatedAt: "2026-09-18T06:10:00.000Z",
     },
     {
@@ -63,6 +86,9 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      previewWidth: 480,
+      previewFont: 32,
+      acceptance: null,
       updatedAt: "2026-09-23T02:40:00.000Z",
     },
     {
@@ -78,9 +104,15 @@ export const createSeedProject = (): SignProject => {
       comments: [],
       versions: [],
       emergencyRevision: false,
+      previewWidth: 480,
+      previewFont: 30,
+      acceptance: null,
       updatedAt: "2026-09-24T04:15:00.000Z",
     },
   ];
+
+  // 已确认标识携带一次仍然有效的版面验收（960px / 48px / 3 行，符合商场疏散标准）。
+  signs[1].acceptance = layoutAcceptance(signs[1], "商场疏散", "mall", signs[1].updatedAt);
 
   return {
     id: "public-sign-review-1008",
