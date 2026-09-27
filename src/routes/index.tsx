@@ -1,11 +1,23 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
-import { createSeedProject, STATUS_LABELS, uid } from "../data";
+import { createSeedProject, normalizeProject, STATUS_LABELS, uid } from "../data";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import {
+  analyzeSign,
+  canConfirmSign,
+  cloneTerms,
+  DEFAULT_FONT,
+  DEFAULT_WIDTH,
+  diffText,
+  evaluateLayout,
+  FONT_MAX,
+  FONT_MIN,
+  reviewAcceptance,
+  WIDTHS,
+  type AcceptanceState,
+} from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
-const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
   title: "公共标识多语言校对台",
@@ -21,14 +33,43 @@ function statusClass(status: ReviewStatus) {
   return "badge-neutral";
 }
 
+function acceptanceClass(state: AcceptanceState) {
+  if (state === "valid") return "badge-success";
+  if (state === "stale") return "badge-warning";
+  if (state === "failed") return "badge-error";
+  return "badge-ghost";
+}
+
+const ACCEPTANCE_LABELS: Record<AcceptanceState, string> = {
+  valid: "验收有效",
+  stale: "验收失效",
+  failed: "验收未通过",
+  none: "未验收",
+};
+
+function reviewSummary(sign: SignItem): string {
+  const review = reviewAcceptance(sign);
+  if (review.state === "valid") return "";
+  const parts: string[] = [];
+  if (review.check?.shortReasons) parts.push(review.check.shortReasons);
+  if (review.state === "stale") parts.push(...review.staleReasons);
+  if (review.state === "none") parts.push("未保存验收");
+  if (review.state === "failed") parts.push("上次验收未通过");
+  return parts.filter(Boolean).join("；");
+}
+
+/** 模块级纯函数：可被 $ QRL 安全引用，避免闭包捕获组件内函数 */
+function getActiveSign(project: SignProject, previewId: string): SignItem {
+  return project.signs.find((sign) => sign.id === (previewId || project.activeSignId)) ?? project.signs[0];
+}
+
 export default component$(() => {
   const project = useSignal<SignProject>(createSeedProject());
   const past = useSignal<SignProject[]>([]);
   const future = useSignal<SignProject[]>([]);
   const hydrated = useSignal(false);
   const online = useSignal(true);
-  const previewWidth = useSignal(480);
-  const previewFont = useSignal(42);
+  const layoutFilter = useSignal(false);
   const selectedVersionId = useSignal("");
   const termSource = useSignal("");
   const termTarget = useSignal("");
@@ -54,6 +95,15 @@ export default component$(() => {
       const sign = draft.signs.find((item) => item.id === draft.activeSignId);
       if (sign) update(sign, draft);
     });
+  });
+
+  /** 拖动宽度/字号时直接写入当前标识（不占撤销历史），每条标识各自保存 */
+  const patchPreview = $((patch: { width?: number; font?: number }) => {
+    const sign = project.value.signs.find((item) => item.id === project.value.activeSignId);
+    if (!sign) return;
+    if (patch.width !== undefined) sign.previewWidth = patch.width;
+    if (patch.font !== undefined) sign.previewFont = patch.font;
+    project.value = { ...project.value, updatedAt: new Date().toISOString() };
   });
 
   const undo = $(() => {
@@ -84,14 +134,16 @@ export default component$(() => {
   });
 
   const setStatus = $((status: ReviewStatus) => {
+    if (status === "confirmed") {
+      const gate = canConfirmSign(getActiveSign(project.value, previewId.value));
+      if (!gate.ok) {
+        toast.value = `无法确认：${gate.messages[0]}`;
+        return;
+      }
+    }
     commit("更新审校状态", (draft) => {
       const sign = draft.signs.find((item) => item.id === draft.activeSignId);
-      if (!sign) return;
-      if (sign.emergencyRevision && status === "confirmed") {
-        sign.status = "pending";
-      } else {
-        sign.status = status;
-      }
+      if (sign) sign.status = status;
     });
   });
 
@@ -100,8 +152,32 @@ export default component$(() => {
       const sign = draft.signs.find((item) => item.id === draft.activeSignId);
       if (!sign) return;
       sign.emergencyRevision = !sign.emergencyRevision;
-      if (sign.emergencyRevision) sign.status = "changes";
+      if (sign.emergencyRevision && sign.status === "confirmed") sign.status = "changes";
     });
+  });
+
+  const runAcceptance = $(() => {
+    const sign = getActiveSign(project.value, previewId.value);
+    const check = evaluateLayout(sign, sign.previewWidth ?? DEFAULT_WIDTH, sign.previewFont ?? DEFAULT_FONT);
+    commit("保存版面验收", (draft) => {
+      const current = draft.signs.find((item) => item.id === draft.activeSignId);
+      if (!current) return;
+      current.acceptance = {
+        id: uid("accept"),
+        passed: check.pass,
+        width: current.previewWidth,
+        fontSize: current.previewFont,
+        standardKey: check.standard?.key ?? "",
+        targetText: current.targetText,
+        targetLanguage: current.targetLanguage,
+        scenario: current.scenario,
+        emergencyRevision: current.emergencyRevision,
+        lineCount: check.lineCount,
+        failureSummary: check.shortReasons,
+        createdAt: new Date().toISOString(),
+      };
+    });
+    toast.value = check.pass ? "版面验收通过，结果已保存" : `验收未通过：${check.shortReasons || "译文为空"}`;
   });
 
   const saveVersion = $(() => {
@@ -174,7 +250,7 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
-  const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
+  const preview = () => analyzeSign(active(), active().previewWidth ?? DEFAULT_WIDTH, active().previewFont ?? DEFAULT_FONT);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
     const version = selectedVersion();
@@ -186,7 +262,7 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) project.value = normalizeProject(stored.project);
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -213,26 +289,25 @@ export default component$(() => {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
-      const command = event.metaKey || event.ctrlKey;
-      if (command && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        event.shiftKey ? undo() : undo();
-      } else if (event.key.toLowerCase() === "j") {
+      const keySign = getActiveSign(project.value, previewId.value);
+      if (event.key.toLowerCase() === "j") {
         event.preventDefault();
         navigateSign(1);
       } else if (event.key.toLowerCase() === "k") {
         event.preventDefault();
         navigateSign(-1);
       } else if (event.key === "[") {
-        const index = WIDTHS.indexOf(previewWidth.value as (typeof WIDTHS)[number]);
-        previewWidth.value = WIDTHS[Math.max(0, index - 1)];
+        const width = keySign.previewWidth ?? DEFAULT_WIDTH;
+        const index = WIDTHS.indexOf(width as (typeof WIDTHS)[number]);
+        patchPreview({ width: WIDTHS[Math.max(0, index - 1)] });
       } else if (event.key === "]") {
-        const index = WIDTHS.indexOf(previewWidth.value as (typeof WIDTHS)[number]);
-        previewWidth.value = WIDTHS[Math.min(WIDTHS.length - 1, index + 1)];
+        const width = keySign.previewWidth ?? DEFAULT_WIDTH;
+        const index = WIDTHS.indexOf(width as (typeof WIDTHS)[number]);
+        patchPreview({ width: WIDTHS[Math.min(WIDTHS.length - 1, index + 1)] });
       } else if (event.key === "-") {
-        previewFont.value = Math.max(28, previewFont.value - 4);
+        patchPreview({ font: Math.max(FONT_MIN, (keySign.previewFont ?? DEFAULT_FONT) - 4) });
       } else if (event.key === "=") {
-        previewFont.value = Math.min(88, previewFont.value + 4);
+        patchPreview({ font: Math.min(FONT_MAX, (keySign.previewFont ?? DEFAULT_FONT) + 4) });
       }
     };
     window.addEventListener("online", updateOnline);
@@ -247,7 +322,10 @@ export default component$(() => {
 
   if (readOnly.value) {
     const sign = active();
-    const analysis = analyzeSign(sign, previewWidth.value, previewFont.value);
+    const width = sign.previewWidth ?? DEFAULT_WIDTH;
+    const font = sign.previewFont ?? DEFAULT_FONT;
+    const analysis = analyzeSign(sign, width, font);
+    const review = reviewAcceptance(sign);
     return (
       <main data-theme="corporate" class="min-h-screen bg-slate-100 p-6">
         <div class="mx-auto max-w-5xl">
@@ -256,21 +334,31 @@ export default component$(() => {
               <div class="text-xs font-bold uppercase tracking-[0.18em] text-slate-500">Read-only preview</div>
               <h1 class="text-2xl font-bold text-slate-800">{sign.code} · {sign.scenario}</h1>
             </div>
-            <span class={`badge ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+            <div class="flex items-center gap-2">
+              <span class={`badge ${acceptanceClass(review.state)}`}>{ACCEPTANCE_LABELS[review.state]}</span>
+              <span class={`badge ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+            </div>
           </div>
           <section class="rounded-3xl bg-white p-14 shadow-xl">
             <div class="mb-3 text-center text-xs text-slate-400">中文原文</div>
             <p class="mx-auto mb-10 max-w-2xl text-center text-lg text-slate-600">{sign.sourceText}</p>
             <div class="mx-auto border-y-4 border-slate-800 py-10 text-center">
-              <p class="whitespace-pre-line font-black leading-tight tracking-wide text-slate-900" style={{ fontSize: `${previewFont.value}px` }}>{analysis.visible.join("\n")}</p>
+              <p class="whitespace-pre-line font-black leading-tight tracking-wide text-slate-900" style={{ fontSize: `${font}px` }}>{analysis.visible.join("\n")}</p>
             </div>
-            <div class="mt-5 text-center text-sm text-slate-500">{sign.targetLanguage} · {sign.regulation}</div>
+            <div class="mt-5 text-center text-sm text-slate-500">{sign.targetLanguage} · {sign.regulation} · 验收版面 {width}px / {font}px</div>
           </section>
           <p class="mt-4 text-center text-xs text-slate-400">此链接读取当前浏览器中的本地版本，仅用于演示只读预览。</p>
         </div>
       </main>
     );
   }
+
+  const current = active();
+  const currentReview = reviewAcceptance(current);
+  const currentCheck = currentReview.check ?? evaluateLayout(current, current.previewWidth ?? DEFAULT_WIDTH, current.previewFont ?? DEFAULT_FONT);
+  const confirmGate = canConfirmSign(current);
+  const failingSigns = project.value.signs.filter((sign) => reviewAcceptance(sign).state !== "valid");
+  const listedSigns = layoutFilter.value ? failingSigns : project.value.signs;
 
   return (
     <div data-theme="corporate" class="min-h-screen bg-slate-100 pb-9 text-slate-800">
@@ -295,16 +383,16 @@ export default component$(() => {
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
-          <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
-            {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
+          <button class={`btn btn-sm ${current.emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
+            {current.emergencyRevision ? "退出紧急修订" : "紧急修订"}
           </button>
         </div>
       </header>
 
-      {active().emergencyRevision && (
+      {current.emergencyRevision && (
         <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
           <span class="text-lg">!</span>
-          <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
+          <span><strong>紧急修订模式</strong>：旧验收已失效、确认操作已锁定，修改后必须重新验收并保存版本。</span>
         </div>
       )}
 
@@ -314,10 +402,24 @@ export default component$(() => {
             <div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">标识清单</div>
             <div class="mt-1 text-lg font-bold text-slate-800">{project.value.signs.length} 处标识</div>
             <p class="mt-1 text-xs leading-5 text-slate-500">{project.value.location}</p>
+            <button
+              class={`btn btn-sm mt-3 w-full ${layoutFilter.value ? "btn-error" : "btn-outline"}`}
+              onClick$={() => { layoutFilter.value = !layoutFilter.value; }}
+            >
+              {layoutFilter.value ? "显示全部标识" : `版面未通过筛选（${failingSigns.length}）`}
+            </button>
+            {layoutFilter.value && (
+              <p class="mt-2 text-[11px] leading-4 text-slate-500">仅列出验收失效、未验收、未通过或不满足当前场景标准的标识。</p>
+            )}
           </div>
           <div class="space-y-2">
-            {project.value.signs.map((sign, index) => {
-              const risk = analyzeSign(sign, previewWidth.value, previewFont.value);
+            {listedSigns.length === 0 && (
+              <div class="rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">所有标识的版面验收均有效。</div>
+            )}
+            {listedSigns.map((sign, index) => {
+              const risk = analyzeSign(sign, sign.previewWidth ?? DEFAULT_WIDTH, sign.previewFont ?? DEFAULT_FONT);
+              const review = reviewAcceptance(sign);
+              const summary = reviewSummary(sign);
               return (
                 <button
                   key={sign.id}
@@ -333,10 +435,14 @@ export default component$(() => {
                   </div>
                   <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
                   <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
-                    <span>{sign.targetLanguage}</span>
+                    <span>{sign.targetLanguage} · {sign.previewWidth ?? DEFAULT_WIDTH}px/{sign.previewFont ?? DEFAULT_FONT}px</span>
                     <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
                       {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
                     </span>
+                  </div>
+                  <div class="mt-1.5 flex items-center gap-1.5">
+                    <span class={`badge badge-xs ${acceptanceClass(review.state)}`}>{ACCEPTANCE_LABELS[review.state]}</span>
+                    {review.state !== "valid" && <span class="text-[10px] leading-3 text-error">{summary}</span>}
                   </div>
                   <span class="sr-only">第 {index + 1} 条</span>
                 </button>
@@ -349,15 +455,27 @@ export default component$(() => {
           <div class="border-b border-slate-200 bg-slate-50 px-6 py-4">
             <div class="flex items-start justify-between gap-5">
               <div>
-                <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">{active().code} · {active().scenario}</div>
+                <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">{current.code} · {current.scenario}</div>
                 <h1 class="mt-1 text-xl font-bold">中文原文与译文校对</h1>
               </div>
               <div class="join">
                 {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => (
-                  <button key={status} class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"}`} onClick$={() => setStatus(status)}>{STATUS_LABELS[status]}</button>
+                  <button
+                    key={status}
+                    class={`btn join-item btn-sm ${current.status === status ? "btn-primary" : "btn-outline"} ${status === "confirmed" && !confirmGate.ok ? "btn-disabled" : ""}`}
+                    title={status === "confirmed" && !confirmGate.ok ? confirmGate.messages.join("；") : ""}
+                    onClick$={() => setStatus(status)}
+                  >
+                    {STATUS_LABELS[status]}
+                  </button>
                 ))}
               </div>
             </div>
+            {!confirmGate.ok && (
+              <div class="alert alert-warning mt-3 py-2 text-xs">
+                <span><strong>暂不能确认：</strong>{confirmGate.messages.join("；")}。</span>
+              </div>
+            )}
           </div>
 
           <div class="space-y-5 p-6">
@@ -369,7 +487,7 @@ export default component$(() => {
                 </div>
                 <textarea
                   class="textarea textarea-bordered min-h-24 w-full text-base leading-7"
-                  value={active().sourceText}
+                  value={current.sourceText}
                   onInput$={(_, element) => updateActive("修改中文原文", (sign) => { sign.sourceText = element.value; sign.status = "draft"; })}
                 />
               </div>
@@ -380,18 +498,23 @@ export default component$(() => {
                 <div class="grid grid-cols-2 gap-4">
                   <label class="form-control">
                     <span class="label-text mb-1 text-xs font-bold text-slate-500">目标语言</span>
-                    <select class="select select-bordered" value={active().targetLanguage} onChange$={(_, element) => updateActive("修改目标语言", (sign) => { sign.targetLanguage = element.value; sign.status = "pending"; })}>
+                    <select class="select select-bordered" value={current.targetLanguage} onChange$={(_, element) => updateActive("修改目标语言", (sign) => { sign.targetLanguage = element.value; sign.status = "pending"; })}>
                       {["English", "日本語", "Français", "Deutsch", "한국어", "Español"].map((language) => <option key={language}>{language}</option>)}
                     </select>
                   </label>
                   <label class="form-control">
                     <span class="label-text mb-1 text-xs font-bold text-slate-500">适用场景</span>
-                    <input class="input input-bordered" value={active().scenario} onInput$={(_, element) => updateActive("修改适用场景", (sign) => { sign.scenario = element.value; })} />
+                    <input class="input input-bordered" value={current.scenario} onInput$={(_, element) => updateActive("修改适用场景", (sign) => { sign.scenario = element.value; })} />
+                    <span class="label-text-alt mt-1 text-[11px] text-slate-400">
+                      {currentCheck.standard
+                        ? `命中「${currentCheck.standard.label}」标准：最低字号 ${currentCheck.standard.minFontSize}px，最多 ${currentCheck.standard.maxLines} 行`
+                        : "未命中轨道交通/商场疏散/公园服务/医院入口标准，无强制字号与行数限制"}
+                    </span>
                   </label>
                 </div>
                 <label class="form-control">
                   <span class="label-text mb-1 text-xs font-bold text-slate-500">法规或规范提示</span>
-                  <input class="input input-bordered" value={active().regulation} onInput$={(_, element) => updateActive("修改法规提示", (sign) => { sign.regulation = element.value; })} />
+                  <input class="input input-bordered" value={current.regulation} onInput$={(_, element) => updateActive("修改法规提示", (sign) => { sign.regulation = element.value; })} />
                 </label>
                 <div class="divider my-0"></div>
                 <div class="flex items-center justify-between">
@@ -400,20 +523,20 @@ export default component$(() => {
                 </div>
                 <textarea
                   class="textarea textarea-bordered min-h-36 w-full text-lg leading-8"
-                  value={active().targetText}
+                  value={current.targetText}
                   onInput$={(_, element) => updateActive("修改译文", (sign) => { sign.targetText = element.value; sign.status = sign.emergencyRevision ? "changes" : "pending"; })}
                 />
                 <div class="flex flex-wrap gap-2">
-                  {active().terms.map((term) => {
-                    const matched = active().targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
+                  {current.terms.map((term) => {
+                    const matched = current.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
                     return (
                       <button
                         key={term.id}
                         title="点击切换术语确认状态"
                         class={`badge badge-lg gap-1 ${matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
                         onClick$={() => updateActive("确认术语", (sign) => {
-                          const current = sign.terms.find((item) => item.id === term.id);
-                          if (current) current.confirmed = !current.confirmed;
+                          const currentTerm = sign.terms.find((item) => item.id === term.id);
+                          if (currentTerm) currentTerm.confirmed = !currentTerm.confirmed;
                         })}
                       >
                         {term.source} → {term.target} {matched ? (term.confirmed ? "✓" : "!") : "×"}
@@ -428,7 +551,7 @@ export default component$(() => {
               <div class="card-body p-5">
                 <div class="flex items-center justify-between">
                   <div><h2 class="font-bold">术语绑定</h2><p class="text-xs text-slate-500">必选术语未出现在译文中时会实时告警。</p></div>
-                  <span class="badge badge-outline">{active().terms.length} 条</span>
+                  <span class="badge badge-outline">{current.terms.length} 条</span>
                 </div>
                 <div class="mt-4 grid grid-cols-[1fr_1fr_auto] gap-2">
                   <input class="input input-sm input-bordered" placeholder="中文术语" value={termSource.value} onInput$={(_, element) => termSource.value = element.value} />
@@ -436,7 +559,7 @@ export default component$(() => {
                   <button class="btn btn-sm btn-primary" onClick$={addTerm}>绑定</button>
                 </div>
                 <div class="mt-3 grid gap-2 md:grid-cols-2">
-                  {active().terms.map((term) => (
+                  {current.terms.map((term) => (
                     <div key={term.id} class="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2">
                       <div class="min-w-0">
                         <div class="truncate text-xs font-bold">{term.source}</div>
@@ -460,8 +583,8 @@ export default component$(() => {
                   <button class="btn btn-primary self-end" onClick$={addComment}>添加意见</button>
                 </div>
                 <div class="mt-4 space-y-3">
-                  {active().comments.length === 0 && <div class="rounded-xl border border-dashed p-6 text-center text-sm text-slate-400">还没有审校意见。</div>}
-                  {active().comments.map((comment) => (
+                  {current.comments.length === 0 && <div class="rounded-xl border border-dashed p-6 text-center text-sm text-slate-400">还没有审校意见。</div>}
+                  {current.comments.map((comment) => (
                     <article key={comment.id} class={`rounded-xl border-l-4 bg-slate-50 p-3 ${comment.resolved ? "border-success opacity-60" : "border-warning"}`}>
                       <div class="flex items-center justify-between text-xs"><strong>{comment.author}</strong><span class="text-slate-400">{new Date(comment.createdAt).toLocaleString()}</span></div>
                       <p class="my-2 text-sm">{comment.body}</p>
@@ -498,25 +621,70 @@ export default component$(() => {
                   </span>
                 </div>
                 <div class="mt-3 flex gap-1">
-                  {WIDTHS.map((width) => <button key={width} class={`btn btn-xs flex-1 ${previewWidth.value === width ? "btn-primary" : "btn-outline"}`} onClick$={() => previewWidth.value = width}>{width}px</button>)}
+                  {WIDTHS.map((width) => <button key={width} class={`btn btn-xs flex-1 ${(current.previewWidth ?? DEFAULT_WIDTH) === width ? "btn-primary" : "btn-outline"}`} onClick$={() => patchPreview({ width })}>{width}px</button>)}
                 </div>
                 <div class="mt-2 flex items-center gap-3 text-xs">
-                  <span class="w-20">字号 {previewFont.value}px</span>
-                  <input type="range" min="28" max="88" step="2" class="range range-primary range-xs flex-1" value={previewFont.value} onInput$={(_, element) => previewFont.value = Number(element.value)} />
+                  <span class="w-20">字号 {(current.previewFont ?? DEFAULT_FONT)}px</span>
+                  <input type="range" min={FONT_MIN} max={FONT_MAX} step="2" class="range range-primary range-xs flex-1" value={current.previewFont ?? DEFAULT_FONT} onInput$={(_, element) => patchPreview({ font: Number(element.value) })} />
                 </div>
+                <p class="mt-1 text-[10px] text-slate-400">宽度与字号按当前标识单独保存，切换标识不再重设。</p>
                 <div class="mt-4 overflow-hidden rounded-xl bg-slate-800 p-3">
-                  <div class="mx-auto grid min-h-48 place-items-center overflow-hidden border-4 border-white bg-[#174f3d] p-3 text-center text-white" style={{ width: `${previewWidth.value}px`, maxWidth: "100%" }}>
+                  <div class="mx-auto grid min-h-48 place-items-center overflow-hidden border-4 border-white bg-[#174f3d] p-3 text-center text-white" style={{ width: `${current.previewWidth ?? DEFAULT_WIDTH}px`, maxWidth: "100%" }}>
                     <div>
-                      <div style={{ fontSize: `${previewFont.value}px` }} class="font-black leading-[1.18] tracking-wide">{preview().visible.map((line, index) => <div key={index}>{line || "\u00a0"}</div>)}</div>
+                      <div style={{ fontSize: `${current.previewFont ?? DEFAULT_FONT}px` }} class="font-black leading-[1.18] tracking-wide">{preview().visible.map((line, index) => <div key={index}>{line || " "}</div>)}</div>
                     </div>
                   </div>
                 </div>
                 <div class="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
                   <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{preview().lines.length}</strong><span>预计行数</span></div>
-                  <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{active().targetText.length}</strong><span>字符数</span></div>
+                  <div class="rounded-lg bg-slate-100 p-2"><strong class="block text-lg">{current.targetText.length}</strong><span>字符数</span></div>
                   <div class="rounded-lg bg-slate-100 p-2"><strong class={`block text-lg ${preview().missingTerms.length ? "text-error" : "text-success"}`}>{preview().missingTerms.length}</strong><span>缺失术语</span></div>
                 </div>
-                {(preview().overflow || preview().tooLong) && <div class="alert alert-error mt-3 py-2 text-xs">{preview().overflow ? "当前字号下内容超过三行，可能截断。" : "译文接近标识建议字符上限。"}</div>}
+                {(preview().overflow || preview().tooLong) && <div class="alert alert-error mt-3 py-2 text-xs">{preview().overflow ? "当前字号下内容超过容量行数，可能截断。" : "译文接近标识建议字符上限。"}</div>}
+              </div>
+            </div>
+
+            <div class="card border border-slate-200 bg-white shadow-sm">
+              <div class="card-body p-4">
+                <div class="flex items-center justify-between">
+                  <div><h2 class="font-bold">场景标准与验收</h2><p class="text-xs text-slate-500">按本标识保存的 {current.previewWidth ?? DEFAULT_WIDTH}px / {current.previewFont ?? DEFAULT_FONT}px 版面验收。</p></div>
+                  <span class={`badge ${acceptanceClass(currentReview.state)}`}>{ACCEPTANCE_LABELS[currentReview.state]}</span>
+                </div>
+                {currentCheck.standard ? (
+                  <div class="mt-3 rounded-lg bg-slate-100 p-3 text-xs leading-6">
+                    <div><strong>{currentCheck.standard.label}</strong> 场景标准</div>
+                    <div>最低字号：{currentCheck.standard.minFontSize}px；最多行数：{currentCheck.standard.maxLines} 行</div>
+                    <div class={currentCheck.fontShortfall ? "font-bold text-error" : "text-success"}>
+                      当前字号 {currentCheck.fontSize}px{currentCheck.fontShortfall ? `，缺 ${currentCheck.fontShortfall}px` : "，达标"}
+                    </div>
+                    <div class={currentCheck.extraLines ? "font-bold text-error" : "text-success"}>
+                      当前 {currentCheck.lineCount} 行{currentCheck.extraLines ? `，超出 ${currentCheck.extraLines} 行` : "，达标"}
+                    </div>
+                  </div>
+                ) : (
+                  <div class="mt-3 rounded-lg bg-slate-100 p-3 text-xs leading-6 text-slate-500">当前场景未匹配四类标准，仅要求译文非空。</div>
+                )}
+                {currentCheck.reasons.length > 0 && (
+                  <ul class="mt-2 list-disc pl-5 text-xs leading-5 text-error">
+                    {currentCheck.reasons.map((reason) => <li key={reason}>{reason}</li>)}
+                  </ul>
+                )}
+                {currentReview.state === "stale" && (
+                  <div class="alert alert-warning mt-3 py-2 text-xs">
+                    <span><strong>旧验收已失效：</strong>{currentReview.staleReasons.join("；")}，请重新验收后才能确认。</span>
+                  </div>
+                )}
+                {current.acceptance && (
+                  <p class="mt-2 text-[11px] text-slate-400">
+                    上次验收：{new Date(current.acceptance.createdAt).toLocaleString()} · {current.acceptance.width}px/{current.acceptance.fontSize}px · {current.acceptance.passed ? "通过" : `未通过（${current.acceptance.failureSummary || "译文为空"}）`}
+                  </p>
+                )}
+                <div class="mt-3 flex gap-2">
+                  <button class={`btn btn-sm ${currentCheck.pass ? "btn-success" : "btn-error"} btn-outline flex-1`} onClick$={runAcceptance}>
+                    {currentCheck.pass ? "保存通过验收" : "保存验收结果（未通过）"}
+                  </button>
+                </div>
+                <p class="mt-2 text-[11px] leading-4 text-slate-500">译文、目标语言、场景、紧急修订状态或场景标准变化后，旧验收自动失效；未达到当前标准不能确认标识。</p>
               </div>
             </div>
 
@@ -524,12 +692,12 @@ export default component$(() => {
               <div class="card-body p-4">
                 <div class="flex items-center justify-between">
                   <div><h2 class="font-bold">版本比较</h2><p class="text-xs text-slate-500">旧版快照与当前译文逐词对比。</p></div>
-                  <span class="badge badge-outline">{active().versions.length} 版</span>
+                  <span class="badge badge-outline">{current.versions.length} 版</span>
                 </div>
-                {active().versions.length ? (
+                {current.versions.length ? (
                   <>
-                    <select class="select select-sm select-bordered mt-3 w-full" value={selectedVersionId.value || active().versions[0].id} onChange$={(_, element) => selectedVersionId.value = element.value}>
-                      {active().versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}`}</option>)}
+                    <select class="select select-sm select-bordered mt-3 w-full" value={selectedVersionId.value || current.versions[0].id} onChange$={(_, element) => selectedVersionId.value = element.value}>
+                      {current.versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}`}</option>)}
                     </select>
                     <div class="mt-3 rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
                       {comparison().map((token, index) => (

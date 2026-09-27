@@ -1,4 +1,5 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type { AcceptanceRecord, ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import { DEFAULT_FONT, DEFAULT_WIDTH, evaluateLayout } from "./utils";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -18,8 +19,39 @@ const term = (source: string, target: string, confirmed = false, required = true
   confirmed,
 });
 
+type RawSign = Omit<SignItem, "previewWidth" | "previewFont" | "acceptance">;
+
+/** 按指定版面参数生成一条验收快照，passed/行数由当时场景标准计算 */
+const acceptanceAt = (
+  sign: RawSign,
+  width: number,
+  fontSize: number,
+  overrides: Partial<AcceptanceRecord> = {},
+): AcceptanceRecord => {
+  const check = evaluateLayout(
+    { ...sign, previewWidth: width, previewFont: fontSize, acceptance: null },
+    width,
+    fontSize,
+  );
+  return {
+    id: uid("accept"),
+    passed: check.pass,
+    width,
+    fontSize,
+    standardKey: check.standard?.key ?? "",
+    targetText: sign.targetText,
+    targetLanguage: sign.targetLanguage,
+    scenario: sign.scenario,
+    emergencyRevision: sign.emergencyRevision,
+    lineCount: check.lineCount,
+    failureSummary: check.shortReasons,
+    createdAt: "2026-09-20T03:00:00.000Z",
+    ...overrides,
+  };
+};
+
 export const createSeedProject = (): SignProject => {
-  const signs: SignItem[] = [
+  const rawSigns: RawSign[] = [
     {
       id: "sign-platform",
       code: "TR-01",
@@ -82,6 +114,33 @@ export const createSeedProject = (): SignProject => {
     },
   ];
 
+  // 每条标识的预览参数与验收独立保存：
+  // - 站台标识在 960px/40px 下验收有效
+  // - 疏散标识的验收快照基于旧译文，译文加长后已失效
+  // - 公园标识从未验收
+  // - 医院入口标识在 320px/28px 下验收未通过（字号不足）
+  const signs: SignItem[] = rawSigns.map((sign) => {
+    if (sign.id === "sign-platform") {
+      return { ...sign, previewWidth: 960, previewFont: 40, acceptance: acceptanceAt(sign, 960, 40) };
+    }
+    if (sign.id === "sign-exit") {
+      const oldText = "EMERGENCY EXIT\nDo not use the elevator.";
+      return {
+        ...sign,
+        previewWidth: 720,
+        previewFont: 36,
+        acceptance: acceptanceAt({ ...sign, targetText: oldText }, 720, 36, {
+          targetText: oldText,
+          createdAt: "2026-09-17T08:30:00.000Z",
+        }),
+      };
+    }
+    if (sign.id === "sign-smoking") {
+      return { ...sign, previewWidth: 320, previewFont: 28, acceptance: acceptanceAt(sign, 320, 28) };
+    }
+    return { ...sign, previewWidth: DEFAULT_WIDTH, previewFont: DEFAULT_FONT, acceptance: null };
+  });
+
   return {
     id: "public-sign-review-1008",
     title: "城市公共标识多语言校对",
@@ -91,3 +150,16 @@ export const createSeedProject = (): SignProject => {
     updatedAt: new Date().toISOString(),
   };
 };
+
+/** 兼容旧版本地数据：补齐每条标识独立的预览参数与验收字段 */
+export function normalizeProject(project: SignProject): SignProject {
+  let changed = false;
+  const signs = project.signs.map((sign) => {
+    if (typeof sign.previewWidth === "number" && typeof sign.previewFont === "number" && "acceptance" in sign) {
+      return sign;
+    }
+    changed = true;
+    return { ...sign, previewWidth: DEFAULT_WIDTH, previewFont: DEFAULT_FONT, acceptance: null };
+  });
+  return changed ? { ...project, signs } : project;
+}

@@ -34,6 +34,23 @@ export interface VersionSnapshot {
   terms: TermBinding[];
 }
 
+export interface AcceptanceRecord {
+  id: string;
+  passed: boolean;
+  width: number;
+  fontSize: number;
+  /** 验收时的场景标准键，标准修订或场景变化后用于判定是否失效 */
+  standardKey: string;
+  /** 验收快照：译文/目标语言/场景/紧急修订任一变化后验收即失效 */
+  targetText: string;
+  targetLanguage: string;
+  scenario: string;
+  emergencyRevision: boolean;
+  lineCount: number;
+  failureSummary: string;
+  createdAt: string;
+}
+
 export interface SignItem {
   id: string;
   code: string;
@@ -47,6 +64,12 @@ export interface SignItem {
   comments: ReviewComment[];
   versions: VersionSnapshot[];
   emergencyRevision: boolean;
+  /** 每条标识独立保存的版面预览宽度 */
+  previewWidth: number;
+  /** 每条标识独立保存的版面预览字号 */
+  previewFont: number;
+  /** 最近一次版面验收结果，内容或标准变化后自动失效 */
+  acceptance: AcceptanceRecord | null;
   updatedAt: string;
 }
 
